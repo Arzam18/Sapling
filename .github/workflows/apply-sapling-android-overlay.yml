@@ -1,10 +1,11 @@
+
 name: Apply Sapling Android Rebase Overlay
 
 on:
   workflow_dispatch:
     inputs:
       archive_path:
-        description: "Path to the modified-files ZIP in the repository root"
+        description: "Modified-files ZIP in repository root"
         required: true
         default: "Sapling-Android-Rebase-Overlay-Modified-Files-Only.zip"
         type: string
@@ -21,23 +22,11 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Check required token
-        env:
-          OVERLAY_TOKEN: ${{ secrets.SAPLING_OVERLAY_TOKEN }}
-        run: |
-          if [ -z "$OVERLAY_TOKEN" ]; then
-            echo "::error::Missing SAPLING_OVERLAY_TOKEN repository secret."
-            echo "Create a Personal Access Token (classic) with repo and workflow scopes."
-            exit 1
-          fi
-
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          token: ${{ secrets.SAPLING_OVERLAY_TOKEN }}
           ref: ${{ github.ref }}
           fetch-depth: 0
-          persist-credentials: true
 
       - name: Validate and extract overlay
         env:
@@ -46,106 +35,83 @@ jobs:
           python3 - <<'PY'
           import os
           import stat
-          import sys
           import zipfile
           from pathlib import Path, PurePosixPath
 
-          archive_name = os.environ["ARCHIVE_PATH"].strip()
-          if not archive_name:
-              raise SystemExit("ERROR: archive_path is empty.")
-
-          archive = Path(archive_name)
+          archive = Path(os.environ["ARCHIVE_PATH"])
           if not archive.is_file():
-              raise SystemExit(f"ERROR: ZIP archive not found: {archive}")
+              raise SystemExit(f"ZIP not found: {archive}")
 
           root = Path.cwd().resolve()
 
-          with zipfile.ZipFile(archive, "r") as zf:
-              entries = zf.infolist()
-
+          with zipfile.ZipFile(archive) as z:
+              entries = z.infolist()
               if not entries:
-                  raise SystemExit("ERROR: ZIP archive is empty.")
+                  raise SystemExit("ZIP is empty")
 
-              # Validate every entry before extracting anything.
               validated = []
 
               for info in entries:
                   name = info.filename
-
-                  if not name or "\\" in name:
-                      raise SystemExit(f"ERROR: Invalid ZIP path: {name!r}")
-
                   rel = PurePosixPath(name)
 
-                  if rel.is_absolute() or any(
-                      part in ("", ".", "..") for part in rel.parts
-                  ):
-                      raise SystemExit(f"ERROR: Unsafe ZIP path: {name}")
+                  if not name or "\\" in name or rel.is_absolute():
+                      raise SystemExit(f"Unsafe path: {name}")
 
-                  if rel.parts and rel.parts[0].lower() == ".git":
-                      raise SystemExit("ERROR: ZIP may not modify the .git directory.")
+                  if any(p in ("", ".", "..") for p in rel.parts):
+                      raise SystemExit(f"Unsafe path: {name}")
 
-                  unix_mode = (info.external_attr >> 16) & 0xFFFF
-                  if stat.S_ISLNK(unix_mode):
-                      raise SystemExit(f"ERROR: Symlink entries are not allowed: {name}")
+                  if rel.parts[0].lower() == ".git":
+                      raise SystemExit(f"Cannot modify .git: {name}")
+
+                  mode = (info.external_attr >> 16) & 0xFFFF
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"Symlink not allowed: {name}")
 
                   target = (root / Path(*rel.parts)).resolve()
-
                   if target != root and root not in target.parents:
-                      raise SystemExit(f"ERROR: ZIP path escapes repository: {name}")
+                      raise SystemExit(f"Path escapes repository: {name}")
 
                   validated.append((info, target))
 
-              extracted = 0
-
+              count = 0
               for info, target in validated:
                   if info.is_dir():
                       target.mkdir(parents=True, exist_ok=True)
                       continue
 
                   target.parent.mkdir(parents=True, exist_ok=True)
+                  with z.open(info) as src, target.open("wb") as dst:
+                      while chunk := src.read(1024 * 1024):
+                          dst.write(chunk)
+                  count += 1
 
-                  with zf.open(info, "r") as source:
-                      with target.open("wb") as destination:
-                          while True:
-                              chunk = source.read(1024 * 1024)
-                              if not chunk:
-                                  break
-                              destination.write(chunk)
-
-                  extracted += 1
-
-          print(f"Successfully extracted {extracted} files.")
-          print("Archive paths were preserved relative to the repository root.")
+          print(f"Extracted {count} files.")
           PY
 
-      - name: Review extracted changes
+      - name: Review changes
         run: |
-          echo "========== GIT STATUS =========="
           git status --short
-
-          echo "========== CHANGE SUMMARY =========="
           git diff --stat
 
-          echo "========== UNTRACKED FILES =========="
-          git ls-files --others --exclude-standard
-
-      - name: Commit overlay changes
+      - name: Commit source and documentation changes
         env:
           ARCHIVE_PATH: ${{ inputs.archive_path }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Add extracted files, but keep the uploaded ZIP as a backup.
-          git add -A -- . ":(exclude)${ARCHIVE_PATH}"
+          # Do not stage workflow files: GITHUB_TOKEN cannot push them.
+          git add -A -- . \
+            ":(exclude).github/workflows/**" \
+            ":(exclude)${ARCHIVE_PATH}"
 
           if git diff --cached --quiet; then
-            echo "No repository changes to commit."
+            echo "No source or documentation changes to commit."
             exit 0
           fi
 
-          echo "========== STAGED CHANGE SUMMARY =========="
+          echo "========== FILES BEING COMMITTED =========="
           git diff --cached --stat
 
           git commit -m "Apply Sapling Android rebase overlay"
@@ -153,5 +119,4 @@ jobs:
       - name: Push changes
         run: |
           git push origin "HEAD:${GITHUB_REF_NAME}"
-
-          echo "Overlay changes pushed successfully."
+          echo "Source and documentation changes pushed successfully."
