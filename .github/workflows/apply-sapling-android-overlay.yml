@@ -1,0 +1,116 @@
+name: Apply Sapling Android Rebase Overlay
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_path:
+        description: 'Path to the modified-files ZIP in the repository root'
+        required: true
+        default: 'Sapling-Android-Rebase-Overlay-Modified-Files-Only.zip'
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: apply-sapling-android-overlay-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply-overlay:
+    name: Extract overlay into its original paths and commit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out selected branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          fetch-depth: 0
+
+      - name: Validate and extract overlay
+        env:
+          ARCHIVE_PATH: ${{ inputs.archive_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import os
+          import pathlib
+          import stat
+          import zipfile
+
+          root = pathlib.Path.cwd().resolve()
+          raw = os.environ.get("ARCHIVE_PATH", "").strip()
+          if not raw:
+              raise SystemExit("ERROR: archive_path is empty")
+
+          archive = (root / raw).resolve()
+          if root not in archive.parents:
+              raise SystemExit("ERROR: archive must be inside the repository")
+          if not archive.is_file():
+              raise SystemExit(f"ERROR: ZIP not found: {raw}")
+          if archive.suffix.lower() != ".zip":
+              raise SystemExit("ERROR: archive_path must point to a .zip file")
+
+          with zipfile.ZipFile(archive) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise SystemExit(f"ERROR: ZIP integrity check failed at {bad}")
+
+              members = zf.infolist()
+              if not members:
+                  raise SystemExit("ERROR: ZIP is empty")
+
+              # Reject absolute paths, traversal, and symlinks before extracting.
+              safe = []
+              for info in members:
+                  name = info.filename.replace("\\", "/")
+                  path = pathlib.PurePosixPath(name)
+                  if path.is_absolute() or ".." in path.parts:
+                      raise SystemExit(f"ERROR: unsafe ZIP path: {info.filename}")
+                  mode = (info.external_attr >> 16) & 0xFFFF
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f"ERROR: symlink entry is not allowed: {info.filename}")
+                  target = (root / pathlib.Path(*path.parts)).resolve()
+                  if target != root and root not in target.parents:
+                      raise SystemExit(f"ERROR: ZIP path escapes repository: {info.filename}")
+                  safe.append((info, target))
+
+              written = 0
+              for info, target in safe:
+                  if info.is_dir():
+                      target.mkdir(parents=True, exist_ok=True)
+                      continue
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  with zf.open(info, "r") as source, target.open("wb") as dest:
+                      while chunk := source.read(1024 * 1024):
+                          dest.write(chunk)
+                  mode = (info.external_attr >> 16) & 0o777
+                  if mode & 0o111:
+                      target.chmod(target.stat().st_mode | 0o111)
+                  written += 1
+
+          print(f"Extracted {written} files from {archive.name} into their archived repository paths.")
+          PY
+
+      - name: Show applied changes
+        run: |
+          set -euo pipefail
+          git status --short
+          git diff --stat
+
+      - name: Commit overlay to the selected branch
+        env:
+          ARCHIVE_PATH: ${{ inputs.archive_path }}
+        run: |
+          set -euo pipefail
+          # Keep the uploaded ZIP as an audit/recovery copy; commit only extracted files.
+          git add -A -- . ":!${ARCHIVE_PATH}"
+          if git diff --cached --quiet; then
+            echo "No extracted changes to commit. The overlay may already be applied."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Apply Sapling Android rebase overlay"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
