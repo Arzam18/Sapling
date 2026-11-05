@@ -1,4 +1,4 @@
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Globalization;
 using Sapling.Engine;
 using Sapling.Engine.DataGen;
@@ -225,6 +225,9 @@ public class UciEngine : IDisposable
             case "uci":
                 Respond($"id name Sapling {_version}");
                 Respond("id author Tim Jones");
+                // Expose the NNUE kernel selected on the target device. Android ARM64 should
+                // report Vector128; this is the .NET AdvSIMD/NEON path, not the scalar fallback.
+                Respond($"info string NNUE backend: {EngineCapabilities.NnueBackend}");
                 Respond($"option name Threads type spin default {_threadCount} min 1 max 1024");
                 Respond($"option name Ponder type check default {_ponderEnabled.ToString().ToLower()}");
                 Respond($"option name UCI_Chess960 type check default {_chess960Enabled.ToString().ToLower()}");
