@@ -1,0 +1,204 @@
+name: Sapling Android ARM64 NativeAOT (Vector128)
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "global.json"
+      - ".github/workflows/android.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Sapling UCI for Android ARM64 (automatic SIMD)
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout Sapling
+        uses: actions/checkout@v4
+
+      - name: Set up .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.100-rc.2.26504.105
+
+      - name: Install build utilities
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y \
+            lld llvm binutils \
+            build-essential zlib1g-dev unzip curl
+
+      - name: Install Android NDK
+        id: setup-ndk
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+
+      - name: Configure Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
+          TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          test -d "$TOOLCHAIN"
+          test -x "$TOOLCHAIN/clang"
+          echo "$TOOLCHAIN" >> "$GITHUB_PATH"
+          echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
+          echo "NDK: $NDK"
+          "$TOOLCHAIN/clang" --version
+
+      - name: Verify the current CLI and NNUE resources
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -f src/Sapling/Sapling.csproj
+          test -f src/Sapling.Engine/Sapling.Engine.csproj
+          test -s src/Sapling.Engine/Resources/sapling.nnue
+          test -s src/Sapling.Engine/Resources/human_policy_v1.weights
+          grep -q 'Vector128.IsHardwareAccelerated' src/Sapling.Engine/EngineCapabilities.cs
+          grep -q 'UseVector128Nnue' src/Sapling.Engine/Evaluation/NnueRefresh.cs
+          echo "Publishing the updated UCI CLI, not the MAUI application."
+          dotnet --info
+          clang --version
+          echo "Version: $(dotnet msbuild src/Sapling/Sapling.csproj -getProperty:Version)"
+
+      - name: Verify automatic backend is not compile-time forced to scalar
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet msbuild src/Sapling.Engine/Sapling.Engine.csproj \
+            -getProperty:DefineConstants \
+            -p:SaplingBackend=Auto > backend-constants.txt
+          cat backend-constants.txt
+          if grep -q 'SAPLING_SCALAR' backend-constants.txt; then
+            echo "::error::SAPLING_SCALAR is defined; Android NEON would be disabled."
+            exit 1
+          fi
+          echo "PASS: automatic Vector128 backend remains enabled."
+
+      - name: Inject the matching NativeAOT Bionic runtime-pack request
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          project = Path("src/Sapling/Sapling.csproj")
+          content = project.read_text(encoding="utf-8-sig")
+          package_id = "Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64"
+          if package_id not in content:
+              item_group = """
+            <ItemGroup>
+              <PackageDownload
+                Include="Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64"
+                Version="[11.0.0-rc.2.26504.105]" />
+            </ItemGroup>
+          """
+              if "</Project>" not in content:
+                  raise SystemExit("Could not find closing Project element.")
+              content = content.replace("</Project>", item_group + "\n</Project>", 1)
+              project.write_text(content, encoding="utf-8-sig")
+              print("Added the linux-bionic-arm64 NativeAOT package request.")
+          else:
+              print("NativeAOT package request already exists.")
+          PY
+
+      - name: Verify evaluated NativeAOT package request
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet msbuild src/Sapling/Sapling.csproj -getItem:PackageDownload > package-download-items.json
+          cat package-download-items.json
+          grep -qi 'Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64' package-download-items.json
+
+      - name: Restore Sapling Android ARM64 with automatic SIMD
+        shell: bash
+        run: |
+          set -euo pipefail
+          dotnet restore src/Sapling/Sapling.csproj \
+            --runtime linux-bionic-arm64 \
+            --force \
+            --no-cache \
+            -p:Configuration=Release \
+            -p:PublishAot=true \
+            -p:PublishAotUsingRuntimePack=true \
+            -p:SelfContained=true \
+            -p:DisableUnsupportedError=true \
+            -p:SaplingBackend=Auto
+
+      - name: Verify downloaded NativeAOT package
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACK="$HOME/.nuget/packages/microsoft.netcore.app.runtime.nativeaot.linux-bionic-arm64/11.0.0-rc.2.26504.105"
+          if [ ! -d "$PACK" ]; then
+            echo "::error::NativeAOT package was not downloaded: $PACK"
+            find "$HOME/.nuget/packages" -maxdepth 1 -type d -iname '*nativeaot*' -print || true
+            exit 1
+          fi
+          echo "NativeAOT package found: $PACK"
+          find "$PACK" -maxdepth 4 -type f | head -100
+
+      - name: Publish Sapling UCI executable (ARM64 Vector128 auto)
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf out
+          mkdir -p out
+          dotnet publish src/Sapling/Sapling.csproj \
+            --configuration Release \
+            --runtime linux-bionic-arm64 \
+            --self-contained true \
+            --no-restore \
+            --output out \
+            -p:PublishAot=true \
+            -p:PublishAotUsingRuntimePack=true \
+            -p:DisableUnsupportedError=true \
+            -p:StripSymbols=true \
+            -p:SaplingBackend=Auto \
+            -p:NoWarn=IL2026%3BIL3050%3BIL3000
+          test -s out/Sapling
+          cat > out/ANDROID-ARM64-BUILD-INFO.txt <<'EOF'
+          Engine: Sapling
+          Source: updated Sapling 2.1.0 tree, with Android NativeAOT workflow restored
+          RID: linux-bionic-arm64
+          NDK: r27c
+          Publish: .NET NativeAOT, self-contained
+          Build backend: Auto (SAPLING_SCALAR is NOT defined)
+          Expected Galaxy A16 backend: Vector128 (.NET ARM64 AdvSIMD/NEON)
+          Runtime override: SAPLING_BACKEND=Vector128 (assert NEON); SAPLING_BACKEND=Scalar (A/B reference)
+          NNUE and human policy: embedded resources from Sapling.Engine
+          EOF
+          echo "Published files:"
+          find out -maxdepth 2 -type f -exec ls -lh {} \;
+
+      - name: Verify Android ARM64 executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          file out/Sapling
+          readelf -h out/Sapling | grep -E 'Class:|Machine:'
+          readelf -h out/Sapling | grep -q AArch64
+          echo "Program interpreter:"
+          readelf -l out/Sapling | grep 'Requesting program interpreter' || true
+          echo "Dynamic dependencies:"
+          readelf -d out/Sapling | grep NEEDED || true
+          echo "SHA-256:"
+          sha256sum out/Sapling
+
+      - name: Upload Sapling Android ARM64
+        uses: actions/upload-artifact@v4
+        with:
+          name: Sapling-Android-ARM64-Vector128-Auto
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
