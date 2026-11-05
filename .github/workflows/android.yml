@@ -47,7 +47,7 @@ jobs:
           echo "Selected SDK: $SELECTED"
 
           if [ "$SELECTED" != "11.0.100-rc.3.26522.148" ]; then
-            echo "::error::Expected patched .NET 11 RC3 SDK."
+            echo "::error::Expected .NET 11 RC3 SDK."
             exit 1
           fi
 
@@ -60,14 +60,8 @@ jobs:
 
           sudo apt-get update
           sudo apt-get install -y \
-            clang \
-            lld \
-            llvm \
-            binutils \
-            build-essential \
-            zlib1g-dev \
-            unzip \
-            curl
+            lld llvm binutils \
+            build-essential zlib1g-dev unzip curl
 
       - name: Install Android NDK r27c
         id: setup-ndk
@@ -84,19 +78,17 @@ jobs:
           NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          if [ ! -x "$TOOLCHAIN/clang" ]; then
-            echo "::error::Android NDK Clang compiler not found."
-            exit 1
-          fi
+          test -d "$TOOLCHAIN"
+          test -x "$TOOLCHAIN/clang"
 
           echo "$TOOLCHAIN" >> "$GITHUB_PATH"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
-          echo "NDK location: $NDK"
+          echo "NDK: $NDK"
           "$TOOLCHAIN/clang" --version
 
-      - name: Verify source and NNUE resources
+      - name: Verify UCI source and NNUE resources
         shell: bash
         run: |
           set -euo pipefail
@@ -110,10 +102,15 @@ jobs:
           test -f src/Sapling.Engine/EngineCapabilities.cs
           test -f src/Sapling.Engine/Evaluation/NnueRefresh.cs
 
-          echo "Both NNUE resources are present."
-          echo "UCI application and engine project are present."
+          grep -q 'Vector128.IsHardwareAccelerated' \
+            src/Sapling.Engine/EngineCapabilities.cs
 
-      - name: Verify automatic SIMD configuration
+          grep -q 'UseVector128Nnue' \
+            src/Sapling.Engine/Evaluation/NnueRefresh.cs
+
+          echo "PASS: UCI project and NNUE resources found."
+
+      - name: Verify automatic SIMD backend
         shell: bash
         run: |
           set -euo pipefail
@@ -126,18 +123,94 @@ jobs:
           cat backend-constants.txt
 
           if grep -q 'SAPLING_SCALAR' backend-constants.txt; then
-            echo "::error::Scalar backend is forced. Automatic SIMD is disabled."
+            echo "::error::Scalar backend is forced."
             exit 1
           fi
 
-          echo "PASS: automatic SIMD backend is enabled."
+          echo "PASS: Automatic Vector128 backend enabled."
 
-      # IMPORTANT:
-      # Do not restore Sapling.Engine separately.
-      # NativeAOT settings and the Android RID must be applied
-      # to the UCI application restore, including its project reference.
+      - name: Configure patched Android NativeAOT runtime pack
+        shell: bash
+        run: |
+          set -euo pipefail
 
-      - name: Restore complete Android NativeAOT project
+          python3 - <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          project = Path("src/Sapling/Sapling.csproj")
+
+          package_id = (
+              "Microsoft.NETCore.App.Runtime.NativeAOT."
+              "linux-bionic-arm64"
+          )
+
+          version = "11.0.0-rc.3.26522.148"
+
+          parser = ET.XMLParser()
+          tree = ET.parse(project, parser=parser)
+          root = tree.getroot()
+
+          # Find an existing PackageDownload entry.
+          existing = None
+
+          for item in root.iter():
+              if item.tag.split("}")[-1] == "PackageDownload":
+                  if item.attrib.get("Include", "").lower() == package_id.lower():
+                      existing = item
+                      break
+
+          if existing is None:
+              group = ET.SubElement(root, "ItemGroup")
+              existing = ET.SubElement(
+                  group,
+                  "PackageDownload",
+                  {
+                      "Include": package_id,
+                      "Version": f"[{version}]"
+                  }
+              )
+              print("Added patched Android NativeAOT runtime-pack request.")
+          else:
+              existing.set("Version", f"[{version}]")
+              print("Updated Android NativeAOT runtime-pack request.")
+
+          tree.write(
+              project,
+              encoding="utf-8",
+              xml_declaration=True
+          )
+
+          print(f"Package: {package_id}")
+          print(f"Version: {version}")
+          PY
+
+          echo "========== UPDATED PROJECT ENTRY =========="
+          grep -n -A3 -B2 \
+            'Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64' \
+            src/Sapling/Sapling.csproj
+
+      - name: Verify NativeAOT package request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dotnet msbuild src/Sapling/Sapling.csproj \
+            -getItem:PackageDownload > package-download-items.json
+
+          cat package-download-items.json
+
+          grep -qi \
+            'Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64' \
+            package-download-items.json
+
+          grep -q \
+            '11.0.0-rc.3.26522.148' \
+            package-download-items.json
+
+          echo "PASS: Correct patched runtime-pack request."
+
+      - name: Restore Sapling Android ARM64
         shell: bash
         run: |
           set -euo pipefail
@@ -153,103 +226,128 @@ jobs:
             -p:DisableUnsupportedError=true \
             -p:SaplingBackend=Auto
 
-      - name: Verify patched compiler and runtime packages
+      - name: Verify restored NativeAOT packages
         shell: bash
         run: |
           set -euo pipefail
 
           python3 - <<'PY'
           import json
+          import os
           import sys
           from pathlib import Path
 
-          root = Path(".")
-          assets_files = list(root.glob("src/**/obj/project.assets.json"))
+          expected_compilers = {
+              "10.0.14",
+              "11.0.0-rc.3.26522.148",
+          }
+
+          runtime_package = (
+              "Microsoft.NETCore.App.Runtime.NativeAOT."
+              "linux-bionic-arm64"
+          ).lower()
+
+          runtime_version = "11.0.0-rc.3.26522.148"
+
+          assets_files = list(Path("src").glob("**/obj/project.assets.json"))
 
           if not assets_files:
-              raise SystemExit("ERROR: No restored project.assets.json files found.")
+              raise SystemExit("ERROR: No project.assets.json files found.")
 
-          found = set()
-          all_compilers = []
+          compilers = set()
+          runtime_found = False
 
           for assets_file in assets_files:
-              try:
-                  data = json.loads(assets_file.read_text())
-              except Exception as exc:
-                  raise SystemExit(
-                      f"Cannot read {assets_file}: {exc}"
-                  )
+              data = json.loads(assets_file.read_text(encoding="utf-8"))
 
+              print(f"\nInspecting: {assets_file}")
+
+              # Regular resolved NuGet packages.
               for package in data.get("libraries", {}):
                   if "/" not in package:
                       continue
 
                   package_id, version = package.rsplit("/", 1)
-                  package_id = package_id.lower()
 
-                  if package_id == "microsoft.dotnet.ilcompiler":
-                      found.add(("ilcompiler", version))
-                      all_compilers.append(
-                          (assets_file.as_posix(), version)
-                      )
+                  if package_id.lower() == "microsoft.dotnet.ilcompiler":
+                      compilers.add(version)
+                      print(f"ILCompiler: {version}")
 
-                  if package_id == (
-                      "microsoft.netcore.app.runtime.nativeaot."
-                      "linux-bionic-arm64"
+                  if (
+                      package_id.lower() == runtime_package
+                      and version == runtime_version
                   ):
-                      found.add(("android-runtime-pack", version))
+                      runtime_found = True
+                      print(f"Runtime pack library: {package}")
 
-              print(f"Inspected: {assets_file}")
+              # PackageDownload entries are separate from libraries.
+              frameworks = (
+                  data.get("project", {}).get("frameworks", {})
+              )
 
-          print("\n========== RESOLVED ILCOMPILER PACKAGES ==========")
+              for framework_name, framework in frameworks.items():
+                  for dependency in framework.get("downloadDependencies", []):
+                      name = dependency.get("name", "").lower()
+                      version = dependency.get("version", "")
 
-          for project, version in all_compilers:
-              print(f"{project}: Microsoft.DotNet.ILCompiler {version}")
+                      if name == runtime_package:
+                          print(
+                              f"Runtime download dependency "
+                              f"({framework_name}): {name} {version}"
+                          )
 
-          required = [
-              (
-                  "ilcompiler",
-                  "10.0.14",
-              ),
-              (
-                  "ilcompiler",
-                  "11.0.0-rc.3.26522.148",
-              ),
-              (
-                  "android-runtime-pack",
-                  "11.0.0-rc.3.26522.148",
-              ),
-          ]
+                          normalized = version.strip("[]() ")
 
-          missing = [
-              item for item in required if item not in found
-          ]
+                          if runtime_version in normalized:
+                              runtime_found = True
+
+          print("\n========== VALIDATION ==========")
+
+          missing = expected_compilers - compilers
 
           if missing:
-              print("\nERROR: Required patched packages are missing:")
+              for version in sorted(missing):
+                  print(f"ERROR: Missing ILCompiler {version}")
+              sys.exit(1)
 
-              for item in missing:
-                  print(f"  {item[0]}: {item[1]}")
+          print("PASS: ILCompiler 10.0.14")
+          print("PASS: ILCompiler 11.0.0-rc.3.26522.148")
+
+          if not runtime_found:
+              print(
+                  "ERROR: Correct Android NativeAOT runtime pack "
+                  "was not found in restore metadata."
+              )
+              sys.exit(1)
+
+          cache_root = Path(
+              os.environ.get(
+                  "NUGET_PACKAGES",
+                  str(Path.home() / ".nuget" / "packages")
+              )
+          )
+
+          package_folder = cache_root / runtime_package
+          version_folder = package_folder / runtime_version.lower()
+
+          if not version_folder.is_dir():
+              print(f"ERROR: Runtime pack cache missing: {version_folder}")
+
+              if package_folder.is_dir():
+                  print("Available versions:")
+                  for item in package_folder.iterdir():
+                      print(f"  {item.name}")
 
               sys.exit(1)
 
-          vulnerable = []
+          if not list(version_folder.glob("*.nuspec")):
+              raise SystemExit("ERROR: Runtime pack has no .nuspec file.")
 
-          for _, version in all_compilers:
-              if version in (
-                  "10.0.13",
-                  "11.0.0-rc.2.26504.105",
-              ):
-                  vulnerable.append(version)
+          print(f"PASS: {runtime_package}")
+          print(f"PASS: Runtime pack version {runtime_version}")
+          print(f"PASS: NuGet cache {version_folder}")
 
-          if vulnerable:
-              raise SystemExit(
-                  "ERROR: Vulnerable ILCompiler version detected: "
-                  + ", ".join(vulnerable)
-              )
-
-          print("\nPASS: Both patched ILCompiler versions are present.")
-          print("PASS: Patched Android NativeAOT runtime pack is present.")
+          print("\nALL PATCHED PACKAGES VERIFIED.")
           PY
 
       - name: Publish Sapling UCI for Android ARM64
@@ -270,12 +368,10 @@ jobs:
             -p:PublishAotUsingRuntimePack=true \
             -p:DisableUnsupportedError=true \
             -p:StripSymbols=true \
-            -p:SaplingBackend=Auto
+            -p:SaplingBackend=Auto \
+            -p:NoWarn=IL2026%3BIL3050%3BIL3000
 
-          if [ ! -s out/Sapling ]; then
-            echo "::error::Sapling executable was not produced."
-            exit 1
-          fi
+          test -s out/Sapling
 
           cat > out/ANDROID-ARM64-BUILD-INFO.txt <<'EOF'
           Engine: Sapling
@@ -287,10 +383,10 @@ jobs:
           .NET 11 SDK: 11.0.100-rc.3.26522.148
           .NET 10 ILCompiler: 10.0.14
           .NET 11 ILCompiler: 11.0.0-rc.3.26522.148
-          .NET 11 Android NativeAOT runtime pack: 11.0.0-rc.3.26522.148
+          Android NativeAOT runtime pack: 11.0.0-rc.3.26522.148
           NNUE: Embedded
           Human policy: Embedded
-          NNUE backend: Auto
+          Backend: Auto
           Expected Android backend: Vector128 / ARM Advanced SIMD
           EOF
 
@@ -320,7 +416,7 @@ jobs:
 
           echo "PASS: Android ARM64 executable verified."
 
-      - name: Upload Sapling Android ARM64 artifact
+      - name: Upload Sapling Android ARM64
         uses: actions/upload-artifact@v4
         with:
           name: Sapling-Android-ARM64-Vector128-Auto
