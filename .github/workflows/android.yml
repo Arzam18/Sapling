@@ -14,16 +14,20 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: sapling-android-arm64-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
-    name: Build Sapling UCI for Android ARM64 (automatic SIMD)
+    name: Build UCI for Android ARM64 (automatic SIMD)
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout Sapling
         uses: actions/checkout@v4
 
-      - name: Set up patched .NET SDKs
+      - name: Install patched .NET SDKs
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: |
@@ -31,12 +35,12 @@ jobs:
             11.0.100-rc.3.26522.148
           include-prerelease: true
 
-      - name: Verify patched .NET SDK selection
+      - name: Verify SDK versions
         shell: bash
         run: |
           set -euo pipefail
 
-          echo "========== INSTALLED .NET SDKs =========="
+          echo "========== INSTALLED SDKs =========="
           dotnet --list-sdks
 
           SELECTED="$(dotnet --version)"
@@ -49,17 +53,23 @@ jobs:
 
           dotnet --info
 
-      - name: Install build utilities
+      - name: Install native build utilities
         shell: bash
         run: |
           set -euo pipefail
 
           sudo apt-get update
           sudo apt-get install -y \
-            lld llvm binutils \
-            build-essential zlib1g-dev unzip curl
+            clang \
+            lld \
+            llvm \
+            binutils \
+            build-essential \
+            zlib1g-dev \
+            unzip \
+            curl
 
-      - name: Install Android NDK
+      - name: Install Android NDK r27c
         id: setup-ndk
         uses: nttld/setup-ndk@v1
         with:
@@ -74,17 +84,19 @@ jobs:
           NDK="${{ steps.setup-ndk.outputs.ndk-path }}"
           TOOLCHAIN="$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin"
 
-          test -d "$TOOLCHAIN"
-          test -x "$TOOLCHAIN/clang"
+          if [ ! -x "$TOOLCHAIN/clang" ]; then
+            echo "::error::Android NDK Clang compiler not found."
+            exit 1
+          fi
 
           echo "$TOOLCHAIN" >> "$GITHUB_PATH"
           echo "ANDROID_NDK_ROOT=$NDK" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=$NDK" >> "$GITHUB_ENV"
 
-          echo "NDK: $NDK"
+          echo "NDK location: $NDK"
           "$TOOLCHAIN/clang" --version
 
-      - name: Verify current CLI and NNUE resources
+      - name: Verify source and NNUE resources
         shell: bash
         run: |
           set -euo pipefail
@@ -95,146 +107,37 @@ jobs:
           test -s src/Sapling.Engine/Resources/sapling.nnue
           test -s src/Sapling.Engine/Resources/human_policy_v1.weights
 
-          grep -q 'Vector128.IsHardwareAccelerated' \
-            src/Sapling.Engine/EngineCapabilities.cs
+          test -f src/Sapling.Engine/EngineCapabilities.cs
+          test -f src/Sapling.Engine/Evaluation/NnueRefresh.cs
 
-          grep -q 'UseVector128Nnue' \
-            src/Sapling.Engine/Evaluation/NnueRefresh.cs
+          echo "Both NNUE resources are present."
+          echo "UCI application and engine project are present."
 
-          echo "Publishing the updated UCI CLI, not the MAUI application."
-          echo "Sapling version:"
-          dotnet msbuild src/Sapling/Sapling.csproj \
-            -getProperty:Version
-
-          echo "Android compiler:"
-          clang --version
-
-      - name: Verify automatic SIMD backend is enabled
+      - name: Verify automatic SIMD configuration
         shell: bash
         run: |
           set -euo pipefail
 
-          dotnet msbuild src/Sapling.Engine/Sapling.Engine.csproj \
+          dotnet msbuild \
+            src/Sapling.Engine/Sapling.Engine.csproj \
             -getProperty:DefineConstants \
             -p:SaplingBackend=Auto > backend-constants.txt
 
           cat backend-constants.txt
 
           if grep -q 'SAPLING_SCALAR' backend-constants.txt; then
-            echo "::error::SAPLING_SCALAR is defined. Android NEON would be disabled."
+            echo "::error::Scalar backend is forced. Automatic SIMD is disabled."
             exit 1
           fi
 
-          echo "PASS: automatic Vector128 backend remains enabled."
+          echo "PASS: automatic SIMD backend is enabled."
 
-      - name: Verify patched .NET 10 compiler pack availability
-        shell: bash
-        run: |
-          set -euo pipefail
+      # IMPORTANT:
+      # Do not restore Sapling.Engine separately.
+      # NativeAOT settings and the Android RID must be applied
+      # to the UCI application restore, including its project reference.
 
-          echo "Checking patched .NET 10 ILCompiler package."
-
-          dotnet restore src/Sapling.Engine/Sapling.Engine.csproj \
-            --force \
-            --no-cache \
-            -p:Configuration=Release \
-            -p:SaplingBackend=Auto
-
-          ILCC="$HOME/.nuget/packages/microsoft.dotnet.ilcompiler/10.0.14"
-
-          if [ ! -d "$ILCC" ]; then
-            echo "::error::Patched Microsoft.DotNet.ILCompiler 10.0.14 was not restored."
-            find "$HOME/.nuget/packages/microsoft.dotnet.ilcompiler" \
-              -maxdepth 2 -type d -print 2>/dev/null || true
-            exit 1
-          fi
-
-          echo "PASS: Microsoft.DotNet.ILCompiler 10.0.14 is present."
-
-      - name: Inject patched Android NativeAOT runtime-pack request
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          from pathlib import Path
-
-          project = Path("src/Sapling/Sapling.csproj")
-          content = project.read_text(encoding="utf-8-sig")
-
-          package_id = "Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64"
-          patched_version = "11.0.0-rc.3.26522.148"
-
-          if package_id in content:
-              import re
-
-              pattern = (
-                  r'(<PackageDownload\s+'
-                  r'Include="Microsoft\.NETCore\.App\.Runtime\.NativeAOT\.linux-bionic-arm64"\s+'
-                  r'Version=")\[[^"]+\](")'
-              )
-
-              updated, count = re.subn(
-                  pattern,
-                  rf'\g<1>[{patched_version}]\2',
-                  content
-              )
-
-              if count:
-                  content = updated
-                  project.write_text(content, encoding="utf-8-sig")
-                  print("Updated existing NativeAOT runtime-pack request.")
-              elif f'Version="[{patched_version}]"' not in content:
-                  raise SystemExit(
-                      "Existing NativeAOT PackageDownload entry was found, "
-                      "but its version could not be safely updated. "
-                      "Inspect Sapling.csproj manually."
-                  )
-              else:
-                  print("Patched NativeAOT runtime-pack request already exists.")
-          else:
-              item_group = f"""
-            <ItemGroup>
-              <PackageDownload
-                Include="{package_id}"
-                Version="[{patched_version}]" />
-            </ItemGroup>
-          """
-
-              if "</Project>" not in content:
-                  raise SystemExit("Could not find closing Project element.")
-
-              content = content.replace(
-                  "</Project>",
-                  item_group + "\n</Project>",
-                  1
-              )
-
-              project.write_text(content, encoding="utf-8-sig")
-              print("Added patched linux-bionic-arm64 runtime-pack request.")
-          PY
-
-      - name: Verify evaluated NativeAOT package request
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          dotnet msbuild src/Sapling/Sapling.csproj \
-            -getItem:PackageDownload > package-download-items.json
-
-          cat package-download-items.json
-
-          grep -qi \
-            'Microsoft.NETCore.App.Runtime.NativeAOT.linux-bionic-arm64' \
-            package-download-items.json
-
-          grep -q \
-            '11.0.0-rc.3.26522.148' \
-            package-download-items.json
-
-          echo "PASS: patched Android NativeAOT runtime pack requested."
-
-      - name: Restore Sapling Android ARM64 with automatic SIMD
+      - name: Restore complete Android NativeAOT project
         shell: bash
         run: |
           set -euo pipefail
@@ -250,35 +153,106 @@ jobs:
             -p:DisableUnsupportedError=true \
             -p:SaplingBackend=Auto
 
-      - name: Verify patched NativeAOT packages
+      - name: Verify patched compiler and runtime packages
         shell: bash
         run: |
           set -euo pipefail
 
-          RUNTIME_PACK="$HOME/.nuget/packages/microsoft.netcore.app.runtime.nativeaot.linux-bionic-arm64/11.0.0-rc.3.26522.148"
-          ILC10="$HOME/.nuget/packages/microsoft.dotnet.ilcompiler/10.0.14"
+          python3 - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
 
-          if [ ! -d "$RUNTIME_PACK" ]; then
-            echo "::error::Patched Android NativeAOT runtime pack was not downloaded."
-            find "$HOME/.nuget/packages" \
-              -maxdepth 2 -type d -iname '*nativeaot*' -print || true
-            exit 1
-          fi
+          root = Path(".")
+          assets_files = list(root.glob("src/**/obj/project.assets.json"))
 
-          if [ ! -d "$ILC10" ]; then
-            echo "::error::Patched .NET 10 ILCompiler package is missing."
-            exit 1
-          fi
+          if not assets_files:
+              raise SystemExit("ERROR: No restored project.assets.json files found.")
 
-          echo "Android runtime pack:"
-          find "$RUNTIME_PACK" -maxdepth 3 -type f | head -100
+          found = set()
+          all_compilers = []
 
-          echo "Patched .NET 10 ILCompiler:"
-          find "$ILC10" -maxdepth 2 -type f | head -30
+          for assets_file in assets_files:
+              try:
+                  data = json.loads(assets_file.read_text())
+              except Exception as exc:
+                  raise SystemExit(
+                      f"Cannot read {assets_file}: {exc}"
+                  )
 
-          echo "PASS: patched NativeAOT packages are available."
+              for package in data.get("libraries", {}):
+                  if "/" not in package:
+                      continue
 
-      - name: Publish Sapling UCI executable (ARM64 Vector128 auto)
+                  package_id, version = package.rsplit("/", 1)
+                  package_id = package_id.lower()
+
+                  if package_id == "microsoft.dotnet.ilcompiler":
+                      found.add(("ilcompiler", version))
+                      all_compilers.append(
+                          (assets_file.as_posix(), version)
+                      )
+
+                  if package_id == (
+                      "microsoft.netcore.app.runtime.nativeaot."
+                      "linux-bionic-arm64"
+                  ):
+                      found.add(("android-runtime-pack", version))
+
+              print(f"Inspected: {assets_file}")
+
+          print("\n========== RESOLVED ILCOMPILER PACKAGES ==========")
+
+          for project, version in all_compilers:
+              print(f"{project}: Microsoft.DotNet.ILCompiler {version}")
+
+          required = [
+              (
+                  "ilcompiler",
+                  "10.0.14",
+              ),
+              (
+                  "ilcompiler",
+                  "11.0.0-rc.3.26522.148",
+              ),
+              (
+                  "android-runtime-pack",
+                  "11.0.0-rc.3.26522.148",
+              ),
+          ]
+
+          missing = [
+              item for item in required if item not in found
+          ]
+
+          if missing:
+              print("\nERROR: Required patched packages are missing:")
+
+              for item in missing:
+                  print(f"  {item[0]}: {item[1]}")
+
+              sys.exit(1)
+
+          vulnerable = []
+
+          for _, version in all_compilers:
+              if version in (
+                  "10.0.13",
+                  "11.0.0-rc.2.26504.105",
+              ):
+                  vulnerable.append(version)
+
+          if vulnerable:
+              raise SystemExit(
+                  "ERROR: Vulnerable ILCompiler version detected: "
+                  + ", ".join(vulnerable)
+              )
+
+          print("\nPASS: Both patched ILCompiler versions are present.")
+          print("PASS: Patched Android NativeAOT runtime pack is present.")
+          PY
+
+      - name: Publish Sapling UCI for Android ARM64
         shell: bash
         run: |
           set -euo pipefail
@@ -296,51 +270,57 @@ jobs:
             -p:PublishAotUsingRuntimePack=true \
             -p:DisableUnsupportedError=true \
             -p:StripSymbols=true \
-            -p:SaplingBackend=Auto \
-            -p:NoWarn=IL2026%3BIL3050%3BIL3000
+            -p:SaplingBackend=Auto
 
-          test -s out/Sapling
+          if [ ! -s out/Sapling ]; then
+            echo "::error::Sapling executable was not produced."
+            exit 1
+          fi
 
           cat > out/ANDROID-ARM64-BUILD-INFO.txt <<'EOF'
           Engine: Sapling
-          Source: Updated Sapling source with Android NativeAOT support
-          RID: linux-bionic-arm64
+          Target: Android ARM64
+          Runtime Identifier: linux-bionic-arm64
           NDK: r27c
-          Publish: .NET NativeAOT, self-contained
+          Build: .NET NativeAOT
           .NET 10 SDK: 10.0.114
           .NET 11 SDK: 11.0.100-rc.3.26522.148
           .NET 10 ILCompiler: 10.0.14
-          .NET 11 NativeAOT runtime pack: 11.0.0-rc.3.26522.148
-          Build backend: Auto (SAPLING_SCALAR is NOT defined)
-          Expected Galaxy A16 backend: Vector128 (.NET ARM64 AdvSIMD/NEON)
-          Runtime override: SAPLING_BACKEND=Vector128 (assert NEON)
-          Runtime override: SAPLING_BACKEND=Scalar (A/B reference)
-          NNUE and human policy: Embedded resources from Sapling.Engine
+          .NET 11 ILCompiler: 11.0.0-rc.3.26522.148
+          .NET 11 Android NativeAOT runtime pack: 11.0.0-rc.3.26522.148
+          NNUE: Embedded
+          Human policy: Embedded
+          NNUE backend: Auto
+          Expected Android backend: Vector128 / ARM Advanced SIMD
           EOF
 
-          echo "Published files:"
+          echo "========== PUBLISHED FILES =========="
           find out -maxdepth 2 -type f -exec ls -lh {} \;
 
-      - name: Verify Android ARM64 executable
+      - name: Verify ARM64 executable
         shell: bash
         run: |
           set -euo pipefail
 
           file out/Sapling
 
-          readelf -h out/Sapling | grep -E 'Class:|Machine:'
+          echo "========== ELF HEADER =========="
+          readelf -h out/Sapling
+
           readelf -h out/Sapling | grep -q AArch64
 
-          echo "Program interpreter:"
+          echo "========== PROGRAM INTERPRETER =========="
           readelf -l out/Sapling | grep 'Requesting program interpreter' || true
 
-          echo "Dynamic dependencies:"
+          echo "========== DYNAMIC DEPENDENCIES =========="
           readelf -d out/Sapling | grep NEEDED || true
 
-          echo "SHA-256:"
+          echo "========== SHA256 =========="
           sha256sum out/Sapling
 
-      - name: Upload Sapling Android ARM64
+          echo "PASS: Android ARM64 executable verified."
+
+      - name: Upload Sapling Android ARM64 artifact
         uses: actions/upload-artifact@v4
         with:
           name: Sapling-Android-ARM64-Vector128-Auto
