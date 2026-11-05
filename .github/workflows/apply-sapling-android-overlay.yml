@@ -4,113 +4,154 @@ on:
   workflow_dispatch:
     inputs:
       archive_path:
-        description: 'Path to the modified-files ZIP in the repository root'
+        description: "Path to the modified-files ZIP in the repository root"
         required: true
-        default: 'Sapling-Android-Rebase-Overlay-Modified-Files-Only.zip'
+        default: "Sapling-Android-Rebase-Overlay-Modified-Files-Only.zip"
         type: string
 
 permissions:
   contents: write
 
 concurrency:
-  group: apply-sapling-android-overlay-${{ github.ref }}
+  group: sapling-android-overlay-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
   apply-overlay:
-    name: Extract overlay into its original paths and commit
     runs-on: ubuntu-latest
+
     steps:
-      - name: Check out selected branch
+      - name: Check required token
+        env:
+          OVERLAY_TOKEN: ${{ secrets.SAPLING_OVERLAY_TOKEN }}
+        run: |
+          if [ -z "$OVERLAY_TOKEN" ]; then
+            echo "::error::Missing SAPLING_OVERLAY_TOKEN repository secret."
+            echo "Create a Personal Access Token (classic) with repo and workflow scopes."
+            exit 1
+          fi
+
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.SAPLING_OVERLAY_TOKEN }}
           ref: ${{ github.ref }}
           fetch-depth: 0
+          persist-credentials: true
 
       - name: Validate and extract overlay
         env:
           ARCHIVE_PATH: ${{ inputs.archive_path }}
-        shell: bash
         run: |
-          set -euo pipefail
           python3 - <<'PY'
           import os
-          import pathlib
           import stat
+          import sys
           import zipfile
+          from pathlib import Path, PurePosixPath
 
-          root = pathlib.Path.cwd().resolve()
-          raw = os.environ.get("ARCHIVE_PATH", "").strip()
-          if not raw:
-              raise SystemExit("ERROR: archive_path is empty")
+          archive_name = os.environ["ARCHIVE_PATH"].strip()
+          if not archive_name:
+              raise SystemExit("ERROR: archive_path is empty.")
 
-          archive = (root / raw).resolve()
-          if root not in archive.parents:
-              raise SystemExit("ERROR: archive must be inside the repository")
+          archive = Path(archive_name)
           if not archive.is_file():
-              raise SystemExit(f"ERROR: ZIP not found: {raw}")
-          if archive.suffix.lower() != ".zip":
-              raise SystemExit("ERROR: archive_path must point to a .zip file")
+              raise SystemExit(f"ERROR: ZIP archive not found: {archive}")
 
-          with zipfile.ZipFile(archive) as zf:
-              bad = zf.testzip()
-              if bad:
-                  raise SystemExit(f"ERROR: ZIP integrity check failed at {bad}")
+          root = Path.cwd().resolve()
 
-              members = zf.infolist()
-              if not members:
-                  raise SystemExit("ERROR: ZIP is empty")
+          with zipfile.ZipFile(archive, "r") as zf:
+              entries = zf.infolist()
 
-              # Reject absolute paths, traversal, and symlinks before extracting.
-              safe = []
-              for info in members:
-                  name = info.filename.replace("\\", "/")
-                  path = pathlib.PurePosixPath(name)
-                  if path.is_absolute() or ".." in path.parts:
-                      raise SystemExit(f"ERROR: unsafe ZIP path: {info.filename}")
-                  mode = (info.external_attr >> 16) & 0xFFFF
-                  if stat.S_ISLNK(mode):
-                      raise SystemExit(f"ERROR: symlink entry is not allowed: {info.filename}")
-                  target = (root / pathlib.Path(*path.parts)).resolve()
+              if not entries:
+                  raise SystemExit("ERROR: ZIP archive is empty.")
+
+              # Validate every entry before extracting anything.
+              validated = []
+
+              for info in entries:
+                  name = info.filename
+
+                  if not name or "\\" in name:
+                      raise SystemExit(f"ERROR: Invalid ZIP path: {name!r}")
+
+                  rel = PurePosixPath(name)
+
+                  if rel.is_absolute() or any(
+                      part in ("", ".", "..") for part in rel.parts
+                  ):
+                      raise SystemExit(f"ERROR: Unsafe ZIP path: {name}")
+
+                  if rel.parts and rel.parts[0].lower() == ".git":
+                      raise SystemExit("ERROR: ZIP may not modify the .git directory.")
+
+                  unix_mode = (info.external_attr >> 16) & 0xFFFF
+                  if stat.S_ISLNK(unix_mode):
+                      raise SystemExit(f"ERROR: Symlink entries are not allowed: {name}")
+
+                  target = (root / Path(*rel.parts)).resolve()
+
                   if target != root and root not in target.parents:
-                      raise SystemExit(f"ERROR: ZIP path escapes repository: {info.filename}")
-                  safe.append((info, target))
+                      raise SystemExit(f"ERROR: ZIP path escapes repository: {name}")
 
-              written = 0
-              for info, target in safe:
+                  validated.append((info, target))
+
+              extracted = 0
+
+              for info, target in validated:
                   if info.is_dir():
                       target.mkdir(parents=True, exist_ok=True)
                       continue
-                  target.parent.mkdir(parents=True, exist_ok=True)
-                  with zf.open(info, "r") as source, target.open("wb") as dest:
-                      while chunk := source.read(1024 * 1024):
-                          dest.write(chunk)
-                  mode = (info.external_attr >> 16) & 0o777
-                  if mode & 0o111:
-                      target.chmod(target.stat().st_mode | 0o111)
-                  written += 1
 
-          print(f"Extracted {written} files from {archive.name} into their archived repository paths.")
+                  target.parent.mkdir(parents=True, exist_ok=True)
+
+                  with zf.open(info, "r") as source:
+                      with target.open("wb") as destination:
+                          while True:
+                              chunk = source.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              destination.write(chunk)
+
+                  extracted += 1
+
+          print(f"Successfully extracted {extracted} files.")
+          print("Archive paths were preserved relative to the repository root.")
           PY
 
-      - name: Show applied changes
+      - name: Review extracted changes
         run: |
-          set -euo pipefail
+          echo "========== GIT STATUS =========="
           git status --short
+
+          echo "========== CHANGE SUMMARY =========="
           git diff --stat
 
-      - name: Commit overlay to the selected branch
+          echo "========== UNTRACKED FILES =========="
+          git ls-files --others --exclude-standard
+
+      - name: Commit overlay changes
         env:
           ARCHIVE_PATH: ${{ inputs.archive_path }}
         run: |
-          set -euo pipefail
-          # Keep the uploaded ZIP as an audit/recovery copy; commit only extracted files.
-          git add -A -- . ":!${ARCHIVE_PATH}"
-          if git diff --cached --quiet; then
-            echo "No extracted changes to commit. The overlay may already be applied."
-            exit 0
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          # Add extracted files, but keep the uploaded ZIP as a backup.
+          git add -A -- . ":(exclude)${ARCHIVE_PATH}"
+
+          if git diff --cached --quiet; then
+            echo "No repository changes to commit."
+            exit 0
+          fi
+
+          echo "========== STAGED CHANGE SUMMARY =========="
+          git diff --cached --stat
+
           git commit -m "Apply Sapling Android rebase overlay"
+
+      - name: Push changes
+        run: |
           git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          echo "Overlay changes pushed successfully."
